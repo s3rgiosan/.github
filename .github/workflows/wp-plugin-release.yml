@@ -1,0 +1,140 @@
+name: WP Plugin Release
+
+# Reusable workflow that packages a WordPress plugin and attaches the
+# resulting ZIP to a GitHub Release.
+#
+# Two modes, controlled by the `build` input:
+#
+#   * `build: false` (default) — uses `git archive` against the pushed
+#     tag, so the repo is expected to commit `build/` and `vendor/`
+#     ahead of tagging. Honours every `export-ignore` directive in the
+#     plugin's `.gitattributes`.
+#
+#   * `build: true` — extracts the tagged tree via `git archive`
+#     (honoring `.gitattributes` `export-ignore`), then runs
+#     `composer install --no-dev` and (when a `package.json` is
+#     present) `npm ci && npm run build` inside it, then zips. Use
+#     when the plugin doesn't commit its build artefacts. Excludes
+#     are maintained in `.gitattributes`, not the workflow.
+#
+# Example caller:
+#
+#   name: Release
+#   on:
+#     push:
+#       tags: ['*.*.*']
+#   jobs:
+#     release:
+#       uses: s3rgiosan/.github/.github/workflows/wp-plugin-release.yml@main
+#       with:
+#         slug: my-plugin
+#       permissions:
+#         contents: write
+
+on:
+  workflow_call:
+    inputs:
+      slug:
+        description: 'Plugin slug. Used as the inner folder name and as the ZIP filename prefix.'
+        required: true
+        type: string
+      build:
+        description: 'Build assets in CI before zipping. When false, expects build/ and vendor/ to be committed at the tag.'
+        required: false
+        type: boolean
+        default: false
+      php-version:
+        description: 'PHP version used when `build: true`.'
+        required: false
+        type: string
+        default: '8.1'
+      node-version:
+        description: 'Node version used when `build: true` and a package.json is present.'
+        required: false
+        type: string
+        default: 'lts/*'
+      generate-release-notes:
+        description: 'Auto-generate release notes from commits.'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  release:
+    name: Package & Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: ref
+        run: echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      # --- Build mode ----------------------------------------------------
+
+      - name: Extract tag tree (honors .gitattributes export-ignore)
+        if: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          mkdir -p "staging/${{ inputs.slug }}"
+          git archive --format=tar "${{ steps.ref.outputs.tag }}" \
+            | tar -x -C "staging/${{ inputs.slug }}"
+
+      - name: Setup PHP
+        if: ${{ inputs.build }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php-version }}
+          tools: composer
+
+      - name: Composer install (no dev)
+        if: ${{ inputs.build }}
+        working-directory: "staging/${{ inputs.slug }}"
+        run: composer install --no-dev --optimize-autoloader --no-interaction
+
+      - name: Setup Node
+        if: ${{ inputs.build && hashFiles('package.json') != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: NPM build
+        if: ${{ inputs.build && hashFiles('package.json') != '' }}
+        working-directory: "staging/${{ inputs.slug }}"
+        run: |
+          npm ci
+          npm run build --if-present
+          rm -rf node_modules
+
+      - name: Build ZIP from staging
+        if: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          (cd staging && zip -rq "../${{ inputs.slug }}-${{ steps.ref.outputs.tag }}.zip" "${{ inputs.slug }}")
+
+      # --- Archive mode --------------------------------------------------
+
+      - name: Build ZIP via git archive
+        if: ${{ !inputs.build }}
+        run: |
+          set -euo pipefail
+          git archive \
+            --format=zip \
+            --prefix="${{ inputs.slug }}/" \
+            --output="${{ inputs.slug }}-${{ steps.ref.outputs.tag }}.zip" \
+            "${{ steps.ref.outputs.tag }}"
+
+      # --- Publish -------------------------------------------------------
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: ${{ inputs.generate-release-notes }}
+          files: "${{ inputs.slug }}-${{ steps.ref.outputs.tag }}.zip"
